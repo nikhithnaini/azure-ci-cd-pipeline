@@ -1,0 +1,118 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  ACR_NAME: "typescriptimage"
+  IMAGE_NAME: "my-app"
+  TAG: "$(Build.BuildId)"
+  RESOURCE_GROUP: "linux-agent_group"
+  MANAGED_IDENTITY_NAME: "a717f3e4-b10b-4a70-b565-a471734765b7"
+  APP_NAME: "typescript"
+  SLOT_NAME: "staging"  # Deployment slot
+  APP_PORT: "5000"
+
+stages:
+- stage: Test
+  displayName: "Run Unit and Integration Tests"
+  jobs:
+  - job: RunTests
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '16.x'
+      displayName: "Install Node.js"
+    - script: |
+        npm ci
+        npm run test
+      displayName: "Run Test Suite"
+      workingDirectory: $(System.DefaultWorkingDirectory)
+
+- stage: BuildAndPush
+  displayName: "Build & Push Docker Image"
+  dependsOn: Test
+  condition: succeeded()
+  jobs:
+  - job: BuildAndPushImage
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: Cache@2
+      inputs:
+        key: 'docker | "$(Agent.OS)" | Dockerfile'
+        restoreKeys: |
+          docker | "$(Agent.OS)"
+        path: '/tmp/docker-cache'
+      displayName: "Cache Docker Layers"
+    - script: |
+        az login --identity --client-id $(MANAGED_IDENTITY_NAME)
+        az acr login --name $(ACR_NAME)
+        docker build --cache-from $(ACR_NAME).azurecr.io/$(IMAGE_NAME):latest \
+          -t $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(TAG) .
+        docker push $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(TAG)
+      displayName: "Build and Push Docker Image"
+
+- stage: DeployToStaging
+  displayName: "Deploy to Staging Slot"
+  dependsOn: BuildAndPush
+  condition: succeeded()
+  jobs:
+  - job: DeployContainerToStaging
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        az login --identity --client-id $(MANAGED_IDENTITY_NAME) --allow-no-subscriptions
+        az webapp deployment slot create --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) --slot $(SLOT_NAME) || echo "Slot already exists"
+        az webapp config container set --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) --slot $(SLOT_NAME) \
+          --container-image-name $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(TAG) \
+          --container-registry-url https://$(ACR_NAME).azurecr.io
+        az webapp config appsettings set --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) --slot $(SLOT_NAME) \
+          --settings WEBSITES_PORT=$(APP_PORT)
+        az webapp restart --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) --slot $(SLOT_NAME)
+      displayName: "Deploy and Configure Staging Slot"
+
+- stage: HealthCheckStaging
+  displayName: "Verify Staging Slot Health"
+  dependsOn: DeployToStaging
+  condition: succeeded()
+  jobs:
+  - job: CheckStagingHealth
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        sleep 10
+        curl -f https://$(APP_NAME)-$(SLOT_NAME).azurewebsites.net/health || exit 1
+      displayName: "Check Staging Slot Health"
+
+- stage: SwapToProduction
+  displayName: "Swap Staging to Production"
+  dependsOn: HealthCheckStaging
+  condition: succeeded()
+  jobs:
+  - job: SwapSlots
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        az login --identity --client-id $(MANAGED_IDENTITY_NAME) --allow-no-subscriptions
+        az webapp deployment slot swap --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) --slot $(SLOT_NAME)
+      displayName: "Swap Staging Slot to Production"
+
+- stage: FinalHealthCheck
+  displayName: "Verify Production Health"
+  dependsOn: SwapToProduction
+  condition: succeeded()
+  jobs:
+  - job: CheckProductionHealth
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - script: |
+        sleep 10
+        curl -f https://$(APP_NAME).azurewebsites.net/health || exit 1
+      displayName: "Check Production Health"
