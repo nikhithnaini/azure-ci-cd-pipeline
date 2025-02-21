@@ -1,18 +1,22 @@
+# This pipeline automates testing, building, pushing, deploying, and swapping an Azure App Service container.
+
 trigger:
   branches:
     include:
-      - main
+      - main  # Runs the pipeline when changes are pushed to the main branch
 
+# Define variables for easier management
 variables:
-  ACR_NAME: "typescriptimage"
-  IMAGE_NAME: "my-app"
-  TAG: "$(Build.BuildId)"
-  RESOURCE_GROUP: "linux-agent_group"
-  MANAGED_IDENTITY_NAME: "a717f3e4-b10b-4a70-b565-a471734765b7"
-  APP_NAME: "typescript"
+  ACR_NAME: "typescriptimage"  # Azure Container Registry name
+  IMAGE_NAME: "my-app"  # Docker image name
+  TAG: "$(Build.BuildId)"  # Unique tag for the image (Build ID)
+  RESOURCE_GROUP: "linux-agent_group"  # Azure resource group
+  MANAGED_IDENTITY_NAME: "a717f3e4-b10b-4a70-b565-a471734765b7"  # Managed identity for Azure authentication
+  APP_NAME: "typescript"  # Azure Web App name
   SLOT_NAME: "staging"  # Deployment slot
-  APP_PORT: "5000"
+  APP_PORT: "5000"  # Application port
 
+# Stage 1: Run Unit and Integration Tests
 stages:
 - stage: Test
   displayName: "Run Unit and Integration Tests"
@@ -25,12 +29,14 @@ stages:
       inputs:
         versionSpec: '16.x'
       displayName: "Install Node.js"
+
     - script: |
-        npm ci
-        npm run test
+        npm ci  # Install dependencies
+        npm run test  # Run tests
       displayName: "Run Test Suite"
       workingDirectory: $(System.DefaultWorkingDirectory)
 
+# Stage 2: Build & Push Docker Image to Azure Container Registry
 - stage: BuildAndPush
   displayName: "Build & Push Docker Image"
   dependsOn: Test
@@ -42,19 +48,21 @@ stages:
     steps:
     - task: Cache@2
       inputs:
-        key: 'docker | "$(Agent.OS)" | Dockerfile'
+        key: 'docker | "$(Agent.OS)" | Dockerfile'  # Cache key based on OS and Dockerfile
         restoreKeys: |
           docker | "$(Agent.OS)"
         path: '/tmp/docker-cache'
       displayName: "Cache Docker Layers"
+
     - script: |
-        az login --identity --client-id $(MANAGED_IDENTITY_NAME)
-        az acr login --name $(ACR_NAME)
+        az login --identity --client-id $(MANAGED_IDENTITY_NAME)  # Authenticate using Managed Identity
+        az acr login --name $(ACR_NAME)  # Login to Azure Container Registry
         docker build --cache-from $(ACR_NAME).azurecr.io/$(IMAGE_NAME):latest \
-          -t $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(TAG) .
-        docker push $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(TAG)
+          -t $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(TAG) .  # Build Docker image
+        docker push $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(TAG)  # Push image to ACR
       displayName: "Build and Push Docker Image"
 
+# Stage 3: Deploy to Staging Slot
 - stage: DeployToStaging
   displayName: "Deploy to Staging Slot"
   dependsOn: BuildAndPush
@@ -75,6 +83,7 @@ stages:
         az webapp restart --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) --slot $(SLOT_NAME)
       displayName: "Deploy and Configure Staging Slot"
 
+# Stage 4: Health Check for Staging Slot
 - stage: HealthCheckStaging
   displayName: "Verify Staging Slot Health"
   dependsOn: DeployToStaging
@@ -85,10 +94,11 @@ stages:
       vmImage: 'ubuntu-latest'
     steps:
     - script: |
-        sleep 10
+        sleep 10  # Wait for service to start
         curl -f https://$(APP_NAME)-$(SLOT_NAME).azurewebsites.net/health || exit 1
       displayName: "Check Staging Slot Health"
 
+# Stage 5: Swap Staging Slot to Production
 - stage: SwapToProduction
   displayName: "Swap Staging to Production"
   dependsOn: HealthCheckStaging
@@ -103,6 +113,7 @@ stages:
         az webapp deployment slot swap --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) --slot $(SLOT_NAME)
       displayName: "Swap Staging Slot to Production"
 
+# Stage 6: Final Health Check for Production
 - stage: FinalHealthCheck
   displayName: "Verify Production Health"
   dependsOn: SwapToProduction
@@ -113,6 +124,6 @@ stages:
       vmImage: 'ubuntu-latest'
     steps:
     - script: |
-        sleep 10
+        sleep 10  # Wait for deployment to settle
         curl -f https://$(APP_NAME).azurewebsites.net/health || exit 1
       displayName: "Check Production Health"
