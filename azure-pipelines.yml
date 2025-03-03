@@ -1,127 +1,131 @@
 trigger:
   branches:
     include:
-      - main  # Runs the pipeline when changes are pushed to the main branch
+      - main
 
-# Define variables for easier management
-variables:
-  ACR_NAME: "typescriptimage"  # Azure Container Registry name
-  IMAGE_NAME: "my-app"  # Docker image name
-  TAG: "$(Build.BuildId)"  # Unique tag for the image (Build ID)
-  RESOURCE_GROUP: "linux-agent_group"  # Azure resource group
-  MANAGED_IDENTITY_NAME: "a717f3e4-b10b-4a70-b565-a471734765b7"  # Managed identity for Azure authentication
-  APP_NAME: "typescript"  # Azure Web App name
-  SLOT_NAME: "staging"  # Deployment slot
-  APP_PORT: "5000"  # Application port
-
-# Stage 1: Run Unit and Integration Tests
 stages:
-- stage: Test
-  displayName: "Run Unit and Integration Tests"
-  jobs:
-  - job: RunTests
-    pool:
-      name: 'linux-agent'  # Using self-hosted agent
-    steps:
-    - task: NodeTool@0
-      inputs:
-        versionSpec: '16.x'
-      displayName: "Install Node.js"
+  - stage: CI_CD_Deploy
+    displayName: "CI/CD Deployment Pipeline"
+    jobs:
+      - job: DeployApplication
+        displayName: "Run Tests, Build, Push, and Deploy"
+        pool:
+          name: "linux-agent"
+        steps:
+          # Step 1: Run Tests
+          - task: NodeTool@0
+            inputs:
+              versionSpec: "16.x"
+            displayName: "Install Node.js"
 
-    - script: |
-        npm ci  # Install dependencies
-        npm run test  # Run tests
-      displayName: "Run Test Suite"
-      workingDirectory: $(System.DefaultWorkingDirectory)
+          - script: |
+              npm ci
+              npm run test
+            displayName: "Run Test Suite"
 
-# Stage 2: Build & Push Docker Image to Azure Container Registry
-- stage: BuildAndPush
-  displayName: "Build & Push Docker Image"
-  dependsOn: Test
-  condition: succeeded()
-  jobs:
-  - job: BuildAndPushImage
-    pool:
-      name: 'linux-agent'  # Using self-hosted agent
-    steps:
-    - task: Cache@2
-      inputs:
-        key: 'docker | "$(Agent.OS)" | Dockerfile'  # Cache key based on OS and Dockerfile
-        restoreKeys: |
-          docker | "$(Agent.OS)"
-        path: '/tmp/docker-cache'
-      displayName: "Cache Docker Layers"
+          # Step 2: Check if ACR Exists
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "AzureDevOps-Connection"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                echo "Checking if ACR $ACR_NAME exists..."
+                if ! az acr show --name $ACR_NAME --resource-group $RESOURCE_GROUP &> /dev/null; then
+                  echo "ERROR: ACR $ACR_NAME does not exist. Please create it first."
+                  exit 1
+                fi
+                echo "ACR $ACR_NAME exists."
 
-    - script: |
-        az login --identity --client-id $(MANAGED_IDENTITY_NAME)  # Authenticate using Managed Identity
-        az acr login --name $(ACR_NAME)  # Login to Azure Container Registry
-        docker build --cache-from $(ACR_NAME).azurecr.io/$(IMAGE_NAME):latest \
-          -t $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(TAG) .  # Build Docker image
-        docker push $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(TAG)  # Push image to ACR
-      displayName: "Build and Push Docker Image"
+          # Step 3: Check if UMI has AcrPull Role
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "AzureDevOps-Connection"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                echo "Checking if UMI has AcrPull permission..."
+                ACR_ROLE=$(az role assignment list --assignee $MANAGED_IDENTITY_NAME --scope /subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ContainerRegistry/registries/$ACR_NAME --query "[?roleDefinitionName=='AcrPull']" -o tsv)
+                if [[ -z "$ACR_ROLE" ]]; then
+                  echo "Assigning AcrPull role to UMI..."
+                  az role assignment create --assignee $MANAGED_IDENTITY_NAME --role "AcrPull" --scope /subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ContainerRegistry/registries/$ACR_NAME
+                  echo "AcrPull role assigned to UMI."
+                else
+                  echo "UMI already has AcrPull permission."
+                fi
 
-# Stage 3: Deploy to Staging Slot
-- stage: DeployToStaging
-  displayName: "Deploy to Staging Slot"
-  dependsOn: BuildAndPush
-  condition: succeeded()
-  jobs:
-  - job: DeployContainerToStaging
-    pool:
-      name: 'linux-agent'  # Using self-hosted agent
-    steps:
-    - script: |
-        az login --identity --client-id $(MANAGED_IDENTITY_NAME) --allow-no-subscriptions
-        az webapp deployment slot create --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) --slot $(SLOT_NAME) || echo "Slot already exists"
-        az webapp config container set --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) --slot $(SLOT_NAME) \
-          --container-image-name $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(TAG) \
-          --container-registry-url https://$(ACR_NAME).azurecr.io
-        az webapp config appsettings set --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) --slot $(SLOT_NAME) \
-          --settings WEBSITES_PORT=$(APP_PORT)
-        az webapp restart --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) --slot $(SLOT_NAME)
-      displayName: "Deploy and Configure Staging Slot"
+          # Step 4: Build & Push Docker Image
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "AzureDevOps-Connection"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az acr login --name $ACR_NAME --identity $MANAGED_IDENTITY_NAME
+                docker build -t $ACR_NAME.azurecr.io/$IMAGE_NAME:$BUILD_BUILDID .
+                docker push $ACR_NAME.azurecr.io/$IMAGE_NAME:$BUILD_BUILDID
+            displayName: "Build and Push Docker Image"
 
-# Stage 4: Health Check for Staging Slot
-- stage: HealthCheckStaging
-  displayName: "Verify Staging Slot Health"
-  dependsOn: DeployToStaging
-  condition: succeeded()
-  jobs:
-  - job: CheckStagingHealth
-    pool:
-      name: 'linux-agent'  # Using self-hosted agent
-    steps:
-    - script: |
-        sleep 10  # Wait for service to start
-        curl -f https://$(APP_NAME)-$(SLOT_NAME).azurewebsites.net/health || exit 1
-      displayName: "Check Staging Slot Health"
+          # Step 5: Check if Web App Exists
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "AzureDevOps-Connection"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                echo "Checking if Web App $APP_NAME exists..."
+                if ! az webapp show --name $APP_NAME --resource-group $RESOURCE_GROUP &> /dev/null; then
+                  echo "ERROR: Web App $APP_NAME does not exist. Please create it first."
+                  exit 1
+                fi
+                echo "Web App $APP_NAME exists."
 
-# Stage 5: Swap Staging Slot to Production
-- stage: SwapToProduction
-  displayName: "Swap Staging to Production"
-  dependsOn: HealthCheckStaging
-  condition: succeeded()
-  jobs:
-  - job: SwapSlots
-    pool:
-      name: 'linux-agent'  # Using self-hosted agent
-    steps:
-    - script: |
-        az login --identity --client-id $(MANAGED_IDENTITY_NAME) --allow-no-subscriptions
-        az webapp deployment slot swap --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) --slot $(SLOT_NAME)
-      displayName: "Swap Staging Slot to Production"
+          # Step 6: Check if Service Principal has Managed Identity Operator Role
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "AzureDevOps-Connection"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                echo "Checking if Service Principal has Managed Identity Operator role..."
+                MI_ROLE=$(az role assignment list --assignee $SERVICE_PRINCIPAL_ID --scope /subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Web/sites/$APP_NAME --query "[?roleDefinitionName=='Managed Identity Operator']" -o tsv)
+                if [[ -z "$MI_ROLE" ]]; then
+                  echo "Assigning Managed Identity Operator role to Service Principal..."
+                  az role assignment create --assignee $SERVICE_PRINCIPAL_ID --role "Managed Identity Operator" --scope /subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Web/sites/$APP_NAME
+                  echo "Managed Identity Operator role assigned to Service Principal."
+                else
+                  echo "Service Principal already has Managed Identity Operator permission."
+                fi
 
-# Stage 6: Final Health Check for Production
-- stage: FinalHealthCheck
-  displayName: "Verify Production Health"
-  dependsOn: SwapToProduction
-  condition: succeeded()
-  jobs:
-  - job: CheckProductionHealth
-    pool:
-      name: 'linux-agent'  # Using self-hosted agent
-    steps:
-    - script: |
-        sleep 10  # Wait for deployment to settle
-        curl -f https://$(APP_NAME).azurewebsites.net/health || exit 1
-      displayName: "Check Production Health"
+          # Step 7: Deploy Web App with Container
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "AzureDevOps-Connection"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az webapp config container set --name $APP_NAME --resource-group $RESOURCE_GROUP \
+                  --container-image-name $ACR_NAME.azurecr.io/$IMAGE_NAME:$BUILD_BUILDID \
+                  --container-registry-url https://$ACR_NAME.azurecr.io
+
+                az webapp restart --name $APP_NAME --resource-group $RESOURCE_GROUP
+            displayName: "Deploy and Restart Web App"
+
+          - task: AzureCLI@2
+            inputs:
+              azureSubscription: "AzureDevOps-Connection"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                echo "Configuring diagnostic settings for Azure Monitor..."
+
+                # Enable logs for the web app
+                az monitor diagnostic-settings create \
+                  --name "WebAppDiagnostics" \
+                  --resource "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Web/sites/$APP_NAME" \
+                  --workspace $(LOG_ANALYTICS_WORKSPACE_ID) \
+                  --logs '[{"category": "AppServiceHTTPLogs", "enabled": true, "retentionPolicy": {"enabled": false, "days": 0}}, {"category": "AppServiceConsoleLogs", "enabled": true, "retentionPolicy": {"enabled": false, "days": 0}}, {"category": "AppServiceAppLogs", "enabled": true, "retentionPolicy": {"enabled": false, "days": 0}}]' \
+                  --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"enabled": false, "days": 0}}]'
+
+                echo "Azure Monitor logs configured successfully."
+            displayName: "Enable Azure Monitor Logging"
