@@ -12,7 +12,15 @@ stages:
         pool:
           name: "linux-agent"
         steps:
-          # Step 1: Run Tests
+          # Step 1: Fetch Secrets from Azure Key Vault
+          - task: AzureKeyVault@2
+            inputs:
+              azureSubscription: "AzureDevOps-Connection"
+              KeyVaultName: "$(KEY_VAULT_NAME)"
+              SecretsFilter: "*"
+              runAsPreJob: false
+
+          # Step 2: Run Tests
           - task: NodeTool@0
             inputs:
               versionSpec: "16.x"
@@ -23,21 +31,21 @@ stages:
               npm run test
             displayName: "Run Test Suite"
 
-          # Step 2: Check if ACR Exists
+          # Step 3: Check if ACR Exists
           - task: AzureCLI@2
             inputs:
               azureSubscription: "AzureDevOps-Connection"
               scriptType: "bash"
               scriptLocation: "inlineScript"
               inlineScript: |
-                echo "Checking if ACR $ACR_NAME exists..."
-                if ! az acr show --name $ACR_NAME --resource-group $RESOURCE_GROUP &> /dev/null; then
-                  echo "ERROR: ACR $ACR_NAME does not exist. Please create it first."
+                echo "Checking if ACR $(ACR_NAME) exists..."
+                if ! az acr show --name $(ACR_NAME) --resource-group $(RESOURCE_GROUP) &> /dev/null; then
+                  echo "ERROR: ACR $(ACR_NAME) does not exist. Please create it first."
                   exit 1
                 fi
-                echo "ACR $ACR_NAME exists."
+                echo "ACR $(ACR_NAME) exists."
 
-          # Step 3: Check if UMI has AcrPull Role
+          # Step 4: Check if UMI has AcrPull Role
           - task: AzureCLI@2
             inputs:
               azureSubscription: "AzureDevOps-Connection"
@@ -45,42 +53,42 @@ stages:
               scriptLocation: "inlineScript"
               inlineScript: |
                 echo "Checking if UMI has AcrPull permission..."
-                ACR_ROLE=$(az role assignment list --assignee $MANAGED_IDENTITY_NAME --scope /subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ContainerRegistry/registries/$ACR_NAME --query "[?roleDefinitionName=='AcrPull']" -o tsv)
+                ACR_ROLE=$(az role assignment list --assignee $(MANAGED_IDENTITY_NAME) --scope /subscriptions/$(SUBSCRIPTION_ID)/resourceGroups/$(RESOURCE_GROUP)/providers/Microsoft.ContainerRegistry/registries/$(ACR_NAME) --query "[?roleDefinitionName=='AcrPull']" -o tsv)
                 if [[ -z "$ACR_ROLE" ]]; then
                   echo "Assigning AcrPull role to UMI..."
-                  az role assignment create --assignee $MANAGED_IDENTITY_NAME --role "AcrPull" --scope /subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.ContainerRegistry/registries/$ACR_NAME
+                  az role assignment create --assignee $(MANAGED_IDENTITY_NAME) --role "AcrPull" --scope /subscriptions/$(SUBSCRIPTION_ID)/resourceGroups/$(RESOURCE_GROUP)/providers/Microsoft.ContainerRegistry/registries/$(ACR_NAME)
                   echo "AcrPull role assigned to UMI."
                 else
                   echo "UMI already has AcrPull permission."
                 fi
 
-          # Step 4: Build & Push Docker Image
+          # Step 5: Build & Push Docker Image
           - task: AzureCLI@2
             inputs:
               azureSubscription: "AzureDevOps-Connection"
               scriptType: "bash"
               scriptLocation: "inlineScript"
               inlineScript: |
-                az acr login --name $ACR_NAME --identity $MANAGED_IDENTITY_NAME
-                docker build -t $ACR_NAME.azurecr.io/$IMAGE_NAME:$BUILD_BUILDID .
-                docker push $ACR_NAME.azurecr.io/$IMAGE_NAME:$BUILD_BUILDID
+                az acr login --name $(ACR_NAME) --identity $(MANAGED_IDENTITY_NAME)
+                docker build -t $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(BUILD_BUILDID) .
+                docker push $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(BUILD_BUILDID)
             displayName: "Build and Push Docker Image"
 
-          # Step 5: Check if Web App Exists
+          # Step 6: Check if Web App Exists
           - task: AzureCLI@2
             inputs:
               azureSubscription: "AzureDevOps-Connection"
               scriptType: "bash"
               scriptLocation: "inlineScript"
               inlineScript: |
-                echo "Checking if Web App $APP_NAME exists..."
-                if ! az webapp show --name $APP_NAME --resource-group $RESOURCE_GROUP &> /dev/null; then
-                  echo "ERROR: Web App $APP_NAME does not exist. Please create it first."
+                echo "Checking if Web App $(APP_NAME) exists..."
+                if ! az webapp show --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) &> /dev/null; then
+                  echo "ERROR: Web App $(APP_NAME) does not exist. Please create it first."
                   exit 1
                 fi
-                echo "Web App $APP_NAME exists."
+                echo "Web App $(APP_NAME) exists."
 
-          # Step 6: Check if Service Principal has Managed Identity Operator Role
+          # Step 7: Check if Service Principal has Managed Identity Operator Role
           - task: AzureCLI@2
             inputs:
               azureSubscription: "AzureDevOps-Connection"
@@ -88,27 +96,27 @@ stages:
               scriptLocation: "inlineScript"
               inlineScript: |
                 echo "Checking if Service Principal has Managed Identity Operator role..."
-                MI_ROLE=$(az role assignment list --assignee $SERVICE_PRINCIPAL_ID --scope /subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Web/sites/$APP_NAME --query "[?roleDefinitionName=='Managed Identity Operator']" -o tsv)
+                MI_ROLE=$(az role assignment list --assignee $(SERVICE_PRINCIPAL_ID) --scope /subscriptions/$(SUBSCRIPTION_ID)/resourceGroups/$(RESOURCE_GROUP)/providers/Microsoft.Web/sites/$(APP_NAME) --query "[?roleDefinitionName=='Managed Identity Operator']" -o tsv)
                 if [[ -z "$MI_ROLE" ]]; then
                   echo "Assigning Managed Identity Operator role to Service Principal..."
-                  az role assignment create --assignee $SERVICE_PRINCIPAL_ID --role "Managed Identity Operator" --scope /subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Web/sites/$APP_NAME
+                  az role assignment create --assignee $(SERVICE_PRINCIPAL_ID) --role "Managed Identity Operator" --scope /subscriptions/$(SUBSCRIPTION_ID)/resourceGroups/$(RESOURCE_GROUP)/providers/Microsoft.Web/sites/$(APP_NAME)
                   echo "Managed Identity Operator role assigned to Service Principal."
                 else
                   echo "Service Principal already has Managed Identity Operator permission."
                 fi
 
-          # Step 7: Deploy Web App with Container
+          # Step 8: Deploy Web App with Container
           - task: AzureCLI@2
             inputs:
               azureSubscription: "AzureDevOps-Connection"
               scriptType: "bash"
               scriptLocation: "inlineScript"
               inlineScript: |
-                az webapp config container set --name $APP_NAME --resource-group $RESOURCE_GROUP \
-                  --container-image-name $ACR_NAME.azurecr.io/$IMAGE_NAME:$BUILD_BUILDID \
-                  --container-registry-url https://$ACR_NAME.azurecr.io
+                az webapp config container set --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) \
+                  --container-image-name $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(BUILD_BUILDID) \
+                  --container-registry-url https://$(ACR_NAME).azurecr.io
 
-                az webapp restart --name $APP_NAME --resource-group $RESOURCE_GROUP
+                az webapp restart --name $(APP_NAME) --resource-group $(RESOURCE_GROUP)
             displayName: "Deploy and Restart Web App"
 
           - task: AzureCLI@2
@@ -122,7 +130,7 @@ stages:
                 # Enable logs for the web app
                 az monitor diagnostic-settings create \
                   --name "WebAppDiagnostics" \
-                  --resource "/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Web/sites/$APP_NAME" \
+                  --resource "/subscriptions/$(SUBSCRIPTION_ID)/resourceGroups/$(RESOURCE_GROUP)/providers/Microsoft.Web/sites/$(APP_NAME)" \
                   --workspace $(LOG_ANALYTICS_WORKSPACE_ID) \
                   --logs '[{"category": "AppServiceHTTPLogs", "enabled": true, "retentionPolicy": {"enabled": false, "days": 0}}, {"category": "AppServiceConsoleLogs", "enabled": true, "retentionPolicy": {"enabled": false, "days": 0}}, {"category": "AppServiceAppLogs", "enabled": true, "retentionPolicy": {"enabled": false, "days": 0}}]' \
                   --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"enabled": false, "days": 0}}]'
