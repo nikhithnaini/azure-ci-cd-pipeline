@@ -35,7 +35,7 @@ jobs:
       # Step 3: Build Step (Add your build commands here, for example)
       - task: NodeTool@0
         inputs:
-          versionSpec: '16.x'
+          versionSpec: '22.x'
         displayName: 'Install Node.js'
       
       - script: |
