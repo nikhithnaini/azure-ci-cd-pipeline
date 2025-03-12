@@ -25,12 +25,12 @@ jobs:
           SonarCloud: 'SonarCloud'  # Use your SonarQube connection name
           scannerMode: 'Other'
           configMode: 'manual'
-          projectKey: 'NikhithNaini_typescript'
-          projectName: 'typescript'
-          organization: 'nikhithnaini'
+          projectKey: 'project-key'
+          projectName: 'project_name'
+          organization: 'organization-name'
           extraProperties: |
-            sonar.projectKey=NikhithNaini_typescript
-            sonar.organization=nikhithnaini
+            sonar.projectKey=<project-key>
+            sonar.organization=<organization-name>
 
       # Step 3: Build Step (Add your build commands here, for example)
       - task: NodeTool@0
@@ -42,7 +42,10 @@ jobs:
           npm ci
           npm run build
         displayName: 'Build the project'
-
+        
+      - script: |
+          npm test
+        displayName: 'Run Tests
       # Step 4: Run Code Analysis
       - task: SonarQubeAnalyze@5
 
