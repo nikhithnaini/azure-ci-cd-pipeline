@@ -3,137 +3,183 @@ trigger:
     include:
       - main
 
-stages:
-  - stage: CI_CD_Deploy
+pr:
+  branches:
+    include:
+      - main 
+
+jobs:
+  - job: CI_CD_Deploy
     displayName: "CI/CD Deployment Pipeline"
-    jobs:
-      - job: DeployApplication
-        displayName: "Run Tests, Build, Push, and Deploy"
-        pool:
-          name: "linux-agent"
-        steps:
-          # Step 1: Fetch Secrets from Azure Key Vault
-          - task: AzureKeyVault@2
-            inputs:
-              azureSubscription: "AzureDevOps-Connection"
-              KeyVaultName: "$(KEY_VAULT_NAME)"
-              SecretsFilter: "*"
-              runAsPreJob: false
+    pool:
+      vmImage: 'ubuntu-latest'
 
-          # Step 2: Run Tests
-          - task: NodeTool@0
-            inputs:
-              versionSpec: "16.x"
-            displayName: "Install Node.js"
+    steps:
+      # Step 1: Set Fetch Depth
+      - checkout: self
+        fetchDepth: 0
 
-          - script: |
-              npm ci
-              npm run test
-            displayName: "Run Test Suite"
+      # Step 2: Prepare Analysis Configuration
+      - task: SonarCloudPrepare@1
+        inputs:
+          SonarCloud: 'SonarCloud'  # Use your SonarQube connection name
+          scannerMode: 'Other'
+          configMode: 'manual'
+          projectKey: 'NikhithNaini_typescript'
+          projectName: 'typescript'
+          organization: 'nikhithnaini'
+          extraProperties: |
+            sonar.projectKey=NikhithNaini_typescript
+            sonar.organization=nikhithnaini
 
-          # Step 3: Check if ACR Exists
-          - task: AzureCLI@2
-            inputs:
-              azureSubscription: "AzureDevOps-Connection"
-              scriptType: "bash"
-              scriptLocation: "inlineScript"
-              inlineScript: |
-                echo "Checking if ACR $(ACR_NAME) exists..."
-                if ! az acr show --name $(ACR_NAME) --resource-group $(RESOURCE_GROUP) &> /dev/null; then
-                  echo "ERROR: ACR $(ACR_NAME) does not exist. Please create it first."
-                  exit 1
-                fi
-                echo "ACR $(ACR_NAME) exists."
+      # Step 3: Build Step (Add your build commands here, for example)
+      - task: NodeTool@0
+        inputs:
+          versionSpec: '16.x'
+        displayName: 'Install Node.js'
+      
+      - script: |
+          npm ci
+          npm run build
+        displayName: 'Build the project'
 
-          # Step 4: Check if UMI has AcrPull Role
-          - task: AzureCLI@2
-            inputs:
-              azureSubscription: "AzureDevOps-Connection"
-              scriptType: "bash"
-              scriptLocation: "inlineScript"
-              inlineScript: |
-                echo "Checking if UMI has AcrPull permission..."
-                ACR_ROLE=$(az role assignment list --assignee $(MANAGED_IDENTITY_NAME) --scope /subscriptions/$(SUBSCRIPTION_ID)/resourceGroups/$(RESOURCE_GROUP)/providers/Microsoft.ContainerRegistry/registries/$(ACR_NAME) --query "[?roleDefinitionName=='AcrPull']" -o tsv)
-                if [[ -z "$ACR_ROLE" ]]; then
-                  echo "Assigning AcrPull role to UMI..."
-                  az role assignment create --assignee $(MANAGED_IDENTITY_NAME) --role "AcrPull" --scope /subscriptions/$(SUBSCRIPTION_ID)/resourceGroups/$(RESOURCE_GROUP)/providers/Microsoft.ContainerRegistry/registries/$(ACR_NAME)
-                  echo "AcrPull role assigned to UMI."
-                else
-                  echo "UMI already has AcrPull permission."
-                fi
+      # Step 4: Run Code Analysis
+      - task: SonarQubeAnalyze@5
 
-          # Step 5: Build & Push Docker Image
-          - task: AzureCLI@2
-            inputs:
-              azureSubscription: "AzureDevOps-Connection"
-              scriptType: "bash"
-              scriptLocation: "inlineScript"
-              inlineScript: |
-                az acr login --name $(ACR_NAME) --identity $(MANAGED_IDENTITY_NAME)
-                docker build -t $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(BUILD_BUILDID) .
-                docker push $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(BUILD_BUILDID)
-            displayName: "Build and Push Docker Image"
+      # Step 5: Publish Quality Gate Result (Optional)
+      - task: SonarQubePublish@5
+        inputs:
+          pollingTimeoutSec: '300'  # Time to wait for the analysis to complete before timing out
 
-          # Step 6: Check if Web App Exists
-          - task: AzureCLI@2
-            inputs:
-              azureSubscription: "AzureDevOps-Connection"
-              scriptType: "bash"
-              scriptLocation: "inlineScript"
-              inlineScript: |
-                echo "Checking if Web App $(APP_NAME) exists..."
-                if ! az webapp show --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) &> /dev/null; then
-                  echo "ERROR: Web App $(APP_NAME) does not exist. Please create it first."
-                  exit 1
-                fi
-                echo "Web App $(APP_NAME) exists."
+      # -----------------------------------------
+      # Fetch Secrets from Azure Key Vault
+      # -----------------------------------------
+      - task: AzureKeyVault@2
+        displayName: "Fetch Secrets from Azure Key Vault"
+        inputs:
+          azureSubscription: "AzureDependant"
+          KeyVaultName: "$(KEY-VAULT-NAME)"
+          SecretsFilter: "ACR-NAME, APP-NAME, RESOURCE-GROUP, MANAGED-IDENTITY-NAME, SUBSCRIPTION-ID, SERVICE-PRINCIPAL-ID, LOG-ANALYTICS-WORKSPACE-ID, IMAGE-NAME"
+          runAsPreJob: false
 
-          # Step 7: Check if Service Principal has Managed Identity Operator Role
-          - task: AzureCLI@2
-            inputs:
-              azureSubscription: "AzureDevOps-Connection"
-              scriptType: "bash"
-              scriptLocation: "inlineScript"
-              inlineScript: |
-                echo "Checking if Service Principal has Managed Identity Operator role..."
-                MI_ROLE=$(az role assignment list --assignee $(SERVICE_PRINCIPAL_ID) --scope /subscriptions/$(SUBSCRIPTION_ID)/resourceGroups/$(RESOURCE_GROUP)/providers/Microsoft.Web/sites/$(APP_NAME) --query "[?roleDefinitionName=='Managed Identity Operator']" -o tsv)
-                if [[ -z "$MI_ROLE" ]]; then
-                  echo "Assigning Managed Identity Operator role to Service Principal..."
-                  az role assignment create --assignee $(SERVICE_PRINCIPAL_ID) --role "Managed Identity Operator" --scope /subscriptions/$(SUBSCRIPTION_ID)/resourceGroups/$(RESOURCE_GROUP)/providers/Microsoft.Web/sites/$(APP_NAME)
-                  echo "Managed Identity Operator role assigned to Service Principal."
-                else
-                  echo "Service Principal already has Managed Identity Operator permission."
-                fi
+      # -----------------------------------------
+      # Validate if ACR Exists
+      # -----------------------------------------
+      - task: AzureCLI@2
+        displayName: "Validate ACR Existence"
+        inputs:
+          azureSubscription: "AzureDependant"
+          scriptType: "bash"
+          scriptLocation: "inlineScript"
+          inlineScript: |
+            echo "Checking if ACR $(ACR-NAME) exists..."
+            if ! az acr show --name $(ACR-NAME) --resource-group $(RESOURCE-GROUP) &> /dev/null; then
+              echo "ERROR: ACR $(ACR-NAME) does not exist. Please create it first."
+              exit 1
+            fi
+            echo "✅ ACR $(ACR-NAME) exists."
 
-          # Step 8: Deploy Web App with Container
-          - task: AzureCLI@2
-            inputs:
-              azureSubscription: "AzureDevOps-Connection"
-              scriptType: "bash"
-              scriptLocation: "inlineScript"
-              inlineScript: |
-                az webapp config container set --name $(APP_NAME) --resource-group $(RESOURCE_GROUP) \
-                  --container-image-name $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(BUILD_BUILDID) \
-                  --container-registry-url https://$(ACR_NAME).azurecr.io
+      # -----------------------------------------
+      # Validate if Web App Exists
+      # -----------------------------------------
+      - task: AzureCLI@2
+        displayName: "Validate Web App Existence"
+        inputs:
+          azureSubscription: "AzureDependant"
+          scriptType: "bash"
+          scriptLocation: "inlineScript"
+          inlineScript: |
+            echo "Checking if Web App $(APP-NAME) exists..."
+            if ! az webapp show --name $(APP-NAME) --resource-group $(RESOURCE-GROUP) &> /dev/null; then
+              echo "ERROR: Web App $(APP-NAME) does not exist. Please create it first."
+              exit 1
+            fi
+            echo "✅ Web App $(APP-NAME) exists."
 
-                az webapp restart --name $(APP_NAME) --resource-group $(RESOURCE_GROUP)
-            displayName: "Deploy and Restart Web App"
+      # -----------------------------------------
+      # Build and Push Docker Image to ACR
+      # -----------------------------------------
+      - task: AzureCLI@2
+        displayName: "Build & Push Docker Image to ACR"
+        inputs:
+          azureSubscription: "AzureDependant"
+          scriptType: "bash"
+          scriptLocation: "inlineScript"
+          inlineScript: |
+            echo "Logging into ACR..."
+            az acr login --name $(ACR-NAME)
 
-          - task: AzureCLI@2
-            inputs:
-              azureSubscription: "AzureDevOps-Connection"
-              scriptType: "bash"
-              scriptLocation: "inlineScript"
-              inlineScript: |
-                echo "Configuring diagnostic settings for Azure Monitor..."
+            echo "Building Docker image..."
+            docker build -t $(ACR-NAME).azurecr.io/myapp:$(Build.BuildId) .
 
-                # Enable logs for the web app
-                az monitor diagnostic-settings create \
-                  --name "WebAppDiagnostics" \
-                  --resource "/subscriptions/$(SUBSCRIPTION_ID)/resourceGroups/$(RESOURCE_GROUP)/providers/Microsoft.Web/sites/$(APP_NAME)" \
-                  --workspace $(LOG_ANALYTICS_WORKSPACE_ID) \
-                  --logs '[{"category": "AppServiceHTTPLogs", "enabled": true, "retentionPolicy": {"enabled": false, "days": 0}}, {"category": "AppServiceConsoleLogs", "enabled": true, "retentionPolicy": {"enabled": false, "days": 0}}, {"category": "AppServiceAppLogs", "enabled": true, "retentionPolicy": {"enabled": false, "days": 0}}]' \
-                  --metrics '[{"category": "AllMetrics", "enabled": true, "retentionPolicy": {"enabled": false, "days": 0}}]'
+            echo "Pushing Docker image to ACR..."
+            docker push $(ACR-NAME).azurecr.io/myapp:$(Build.BuildId)
 
-                echo "Azure Monitor logs configured successfully."
-            displayName: "Enable Azure Monitor Logging"
+            echo "Verifying image in ACR..."
+            az acr repository list --name $(ACR-NAME) -o table
+
+      # -----------------------------------------
+      # Deploy Container to Web App
+      # -----------------------------------------
+      - task: AzureCLI@2
+        displayName: "Deploy Container to Web App"
+        inputs:
+          azureSubscription: "AzureDependant"
+          scriptType: "bash"
+          scriptLocation: "inlineScript"
+          inlineScript: |
+            echo "Updating Web App to use ACR image with Managed Identity..."
+            az webapp config container set \
+              --name $(APP-NAME) \
+              --resource-group $(RESOURCE-GROUP) \
+              --container-image-name $(ACR-NAME).azurecr.io/myapp:$(Build.BuildId) \
+              --container-registry-url https://$(ACR-NAME).azurecr.io \
+              --container-registry-user $(SERVICE-PRINCIPAL-ID)
+
+      # -----------------------------------------
+      # Validate Log Analytics Workspace
+      # -----------------------------------------
+      - task: AzureCLI@2
+        displayName: "Validate Log Analytics Workspace"
+        inputs:
+          azureSubscription: "AzureDependant"
+          scriptType: "bash"
+          scriptLocation: "inlineScript"
+          inlineScript: |
+            echo "Checking if Log Analytics Workspace $(LOG-ANALYTICS-WORKSPACE-ID) exists..."
+            if ! az monitor log-analytics workspace show --resource-group $(RESOURCE-GROUP) --workspace-name $(LOG-ANALYTICS-WORKSPACE-ID) &> /dev/null; then
+              echo "ERROR: Log Analytics Workspace $(LOG-ANALYTICS-WORKSPACE-ID) does not exist. Please create it first."
+              exit 1
+            fi
+            echo "✅ Log Analytics Workspace $(LOG-ANALYTICS-WORKSPACE-ID) exists."
+
+      # -----------------------------------------
+      # Enable Web App Log Analytics
+      # -----------------------------------------
+      - task: AzureCLI@2
+        displayName: "Enable Web App Log Analytics"
+        inputs:
+          azureSubscription: "AzureDependant"
+          scriptType: "bash"
+          scriptLocation: "inlineScript"
+          inlineScript: |
+            echo "Fetching Log Analytics Workspace ID..."
+            LOG_ANALYTICS_ID=$(az monitor log-analytics workspace show \
+              --resource-group $(RESOURCE-GROUP) \
+              --workspace-name $(LOG-ANALYTICS-WORKSPACE-ID) \
+              --query "id" -o tsv)
+
+            if [ -z "$LOG_ANALYTICS_ID" ]; then
+              echo "ERROR: Log Analytics Workspace ID not found!"
+              exit 1
+            fi
+
+            echo "Log Analytics Workspace ID: $LOG_ANALYTICS_ID"
+
+            echo "Configuring Diagnostic Settings for Web App..."
+            az monitor diagnostic-settings create \
+              --name "WebAppLogs" \
+              --resource "/subscriptions/$(SUBSCRIPTION-ID)/resourceGroups/$(RESOURCE-GROUP)/providers/Microsoft.Web/sites/$(APP-NAME)" \
+              --logs '[{"category": "AppServiceHTTPLogs", "enabled": true}, {"category": "AppServiceConsoleLogs", "enabled": true}, {"category": "AppServiceAppLogs", "enabled": true}]' \
+              --metrics '[{"category": "AllMetrics", "enabled": true}]' \
+              --workspace "$LOG_ANALYTICS_ID"
