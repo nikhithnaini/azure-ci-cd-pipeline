@@ -1,0 +1,266 @@
+trigger: none
+
+# Remove or comment out the following lines to stop the pipeline from running on PR merges
+pr: none
+
+schedules:
+  - cron: "0 23 * * 6"
+    displayName: Saturday 11:00 PM schedule
+    branches: 
+      include:
+        - main 
+    always: true
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+ - group: OnPoint-EPIC-Incremental-Keys
+ - name: system.debug
+   value: 'false'
+
+stages:
+- stage: Setup
+  displayName: Setup Resources
+  jobs:
+  - job: Setup
+    displayName: Setup
+    steps:
+    - task: AzureCLI@2
+      displayName: Ensure ACR exists and configure
+      inputs:
+        azureSubscription: 'Onpoint-Koyetech-EPIC-Services'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az acr show --name $(acrName) --resource-group $(resourceGroup) || az acr create --name $(acrName) --resource-group $(resourceGroup) --sku Basic
+          # az acr update --name $(acrName) --admin-enabled true
+          az acr update --name $(acrName) --resource-group $(resourceGroup) --set identity.type=SystemAssigned
+
+        addSpnToEnvironment: true 
+        # failOnStandardError: true
+    
+    - task: AzureCLI@2
+      displayName: Grant ACR Access
+      inputs:
+        azureSubscription: 'Onpoint-Koyetech-EPIC-Services'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          # appId=$(az ad sp show --name $(servicePrincipalName) --query appId -o tsv)
+          service=$(az ad sp show --id $(clientId) --query id -o tsv)
+
+          acrId=$(az acr show --name $(acrName) --resource-group $(resourceGroup) --query id -o tsv)
+          echo "service-principal-id: $service, acrId: $acrId"
+          roleAssigned=$(az role assignment list --assignee $service --role "AcrPull" --scope $acrId --query "length([])" -o tsv)
+          echo "role: $roleAssigned "
+          if [ "$roleAssigned" -eq 1 ]; then
+              echo "AcrPull role is already assigned to the service principal. Skipping role assignment."
+          else
+              # If the role is not assigned, assign it
+              echo "AcrPull role is not assigned. Assigning the role..."
+              az role assignment create --assignee $service --role "AcrPull" --scope $acrId
+          fi
+        addSpnToEnvironment: true
+        failOnStandardError: true
+
+    - task: AzureCLI@2
+      displayName: Ensure Log Analytics workspace exists and grant access
+      inputs:
+        azureSubscription: 'Onpoint-Koyetech-EPIC-Services'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az monitor log-analytics workspace show --workspace-name $(logAnalyticsName) --resource-group $(resourceGroup) || az monitor log-analytics workspace create --workspace-name $(logAnalyticsName) --resource-group $(resourceGroup) --location eastus
+          appId=$(az ad sp list --display-name $(servicePrincipalName) --query "[0].appId" -o tsv)
+          logAnalyticsId=$(az monitor log-analytics workspace show --workspace-name $(logAnalyticsName) --resource-group $(resourceGroup) --query id -o tsv)
+          roleAssigned=$(az role assignment list --assignee $appId --role "Log Analytics Reader" --scope $logAnalyticsId --query "length([])" -o tsv)
+
+          # If the role is already assigned (roleAssigned = 1), skip assignment
+          if [ "$roleAssigned" -eq 1 ]; then
+              echo "Log Analytics Reader role is already assigned to the service principal. Skipping role assignment."
+          else
+              # If the role is not assigned, assign it
+              echo "Log Analytics Reader role is not assigned. Assigning the role..."
+              az role assignment create --assignee $appId --role "Log Analytics Reader" --scope $logAnalyticsId
+          fi
+        addSpnToEnvironment: true
+        # failOnStandardError: true
+
+    - task: AzureCLI@2
+      displayName: Ensure Azure Container App Environment exists and grant access
+      inputs:
+        azureSubscription: 'Onpoint-Koyetech-EPIC-Services'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          logAnalyticsId=$(az monitor log-analytics workspace show --workspace-name $(logAnalyticsName) --resource-group $(resourceGroup) --query id -o tsv)
+          containerAppEnvId=$(az containerapp env show --name $(containerAppEnvName) --resource-group $(resourceGroup)  --query id -o tsv)
+          echo " log-id :$logAnalyticsId"
+
+          if [[ -z "$containerAppEnvId" ]]; then
+            echo "Container App Environment does not exist. Creating now..."
+            logsWorkspaceId=$(az monitor log-analytics workspace show --workspace-name $(logAnalyticsName) --resource-group $(resourceGroup) --query customerId -o tsv)
+            logsWorkspaceKey=$(az monitor log-analytics workspace get-shared-keys --resource-group $(resourceGroup) --workspace-name $(logAnalyticsName) --query primarySharedKey -o tsv)
+            containerAppEnvId=$(az containerapp env create --name $(containerAppEnvName) --resource-group $(resourceGroup) --location eastus --logs-workspace-id $logsWorkspaceId --logs-workspace-key $logsWorkspaceKey --query id -o tsv)
+            echo "Container App Environment created with ID: $containerAppEnvId"
+          else
+            echo "Container App Environment already exists with ID: $containerAppEnvId"
+          fi
+
+          appId=$(az ad sp list --display-name $(servicePrincipalName) --query "[0].appId" -o tsv)
+          containerAppEnvId=$(az containerapp env show --name $(containerAppEnvName) --resource-group $(resourceGroup) --query id -o tsv)
+          if [[ -z $(az role assignment list --assignee $appId --scope $containerAppEnvId --role "Contributor" -o tsv) ]]; then
+              az role assignment create --assignee $appId --role "Contributor" --scope $containerAppEnvId
+          else
+              echo "Role already assigned. Skipping..." 
+          fi        
+        addSpnToEnvironment: true
+        # failOnStandardError: true
+
+    - task: AzureCLI@2
+      displayName: Grant Storage Account and Key Vault Access
+      inputs:
+        azureSubscription: 'Onpoint-Koyetech-EPIC-Services'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          appId=$(az ad sp list --display-name $(servicePrincipalName) --query "[0].appId" -o tsv)
+          storageId=$(az storage account show --name $(storageAccountName) --resource-group $(resourceGroup) --query id -o tsv)
+          if [[ -z $(az role assignment list --assignee $appId --scope $storageId --role "Storage Blob Data Contributor" -o tsv) ]]; then
+              az role assignment create --assignee $appId --role "Storage Blob Data Contributor" --scope $storageId
+          else
+              echo "Role already assigned. Skipping..."
+          fi          
+
+        addSpnToEnvironment: true
+        failOnStandardError: true
+
+- stage: Build
+  displayName: Build and Push Docker Image
+  jobs:
+  - job: Build
+    displayName: Build and Push
+    steps:
+    - task: UseNode@1
+      displayName: Use Node.js
+      inputs:
+        version: '22.10.0'
+
+    - script: |
+        npm install
+        npm run build
+      displayName: Install and Build
+
+    # - task: Docker@2
+    #   displayName: Build Docker Image
+    #   inputs:
+    #     command: build
+    #     containerRegistry: 'Onpoint-Koyetech-ContainerRegistry'  # Add this line
+    #     repository: $(acrName).azurecr.io/$(imageName)
+    #     dockerfile: Dockerfile
+    #     tags: |
+    #       $(Build.BuildId)
+    - task: AzureCLI@2
+      displayName: ACR LOGIN
+      inputs:
+        azureSubscription: 'Onpoint-Koyetech-EPIC-Services'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+            az acr login --name $(acrName)
+
+            echo "Building Docker image..."
+            docker build -t $(acrName).azurecr.io/$(imageName):$(Build.BuildId) .
+
+            echo "Pushing Docker image to ACR..."
+            docker push $(acrName).azurecr.io/$(imageName):$(Build.BuildId)
+
+
+    
+    # - task: Docker@2
+    #   displayName: Push Docker Image
+    #   inputs:
+    #     command: push
+    #     containerRegistry: 'Onpoint-Koyetech-ContainerRegistry'
+    #     repository: $(acrName).azurecr.io/$(imageName)
+    #     tags: |
+    #       $(Build.BuildId)
+        
+
+- stage: Deploy
+  displayName: Deploy to Azure Container Web App
+  jobs:
+  - job: Deploy
+    displayName: Deploy 
+    steps:
+    
+    - task: AzureCLI@2
+      displayName: Ensure Azure Container App exists and deploy
+      inputs:
+        azureSubscription: 'Onpoint-Koyetech-EPIC-Services'  
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+             
+              app_exists=$(az containerapp show --name $(containerAppName) --resource-group $(resourceGroup) --query "name" -o tsv || echo "notfound")
+
+              if [ "$app_exists" = "notfound" ]; then
+                az containerapp create --name $(containerAppName) --resource-group $(resourceGroup) --environment $(containerAppEnvName) --target-port 3000 --ingress external --system-assigned
+                principalId=$(az containerapp show --name $(containerAppName) --resource-group $(resourceGroup) --query "identity.principalId" -o tsv)
+                acrId=$(az acr show --name $(acrName) --query id -o tsv)
+                az role assignment create --assignee $principalId --role "AcrPull" --scope $acrId
+              fi
+              principalId=$(az containerapp show --name $(containerAppName) --resource-group $(resourceGroup) --query "identity.principalId" -o tsv)
+              acrId=$(az acr show --name $(acrName) --query id -o tsv)
+
+              az containerapp registry set \
+                --name $(containerAppName) \
+                --resource-group $(resourceGroup) \
+                --server $(acrName).azurecr.io \
+                --identity system 
+              az containerapp update \
+                --name $(containerAppName) \
+                --resource-group $(resourceGroup) \
+                --image $(acrName).azurecr.io/$(imageName):$(Build.BuildId)
+    - task: AzureCLI@2
+      displayName: "Check and Assign Key Vault Secrets User Role"
+      inputs:
+        azureSubscription: 'Onpoint-Koyetech-EPIC-Services'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          containerAppPrincipalId=$(az containerapp show --name $(containerAppName) --resource-group $(resourceGroup) --query "identity.principalId" -o tsv)
+          keyVaultId=$(az keyvault show --name $(keyVaultName) --query id -o tsv)
+          roleAssigned=$(az role assignment list --assignee $containerAppPrincipalId --role "Key Vault Secrets User" --scope $keyVaultId --query "[].roleDefinitionName" -o tsv)
+
+          if [ -z "$roleAssigned" ]; then
+            az role assignment create --assignee $containerAppPrincipalId --role "Key Vault Secrets User" --scope $keyVaultId
+            echo "Key Vault Secrets User role assigned."
+          else
+            echo "Key Vault Secrets User role already assigned."
+          fi
+
+    - task: AzureCLI@2
+      displayName: "Check and Assign Storage Blob Owner Role"
+      inputs:
+        azureSubscription: 'Onpoint-Koyetech-EPIC-Services'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          containerAppPrincipalId=$(az containerapp show --name $(containerAppName) --resource-group $(resourceGroup) --query "identity.principalId" -o tsv)
+          storageAccountId=$(az storage account show --name $(storageAccountName) --resource-group $(resourceGroup) --query id -o tsv)
+          roleAssigned=$(az role assignment list --assignee $containerAppPrincipalId --role "Storage Blob Data Owner" --scope $storageAccountId --query "[].roleDefinitionName" -o tsv)
+
+          if [ -z "$roleAssigned" ]; then
+            az role assignment create --assignee $containerAppPrincipalId --role "Storage Blob Data Owner" --scope $storageAccountId
+            echo "Storage Blob Data Owner role assigned."
+          else
+            echo "Storage Blob Data Owner role already assigned."
+          fi
+      
+
+        # addSpnToEnvironment: true
+        # failOnStandardError: true
+      
